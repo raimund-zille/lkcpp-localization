@@ -15,7 +15,7 @@ We were 5 people and splitted the task into these topics:
 * Gamelogic
 
 ### My contribution
-I worked at the topics Localization and the Lidar-progessing.
+I worked mainly at the topics Localization and the Lidar-progessing.
 We used an Augmented Monte Carlo Localization, and the features where extracted from the Lidar.
 
 ### The playground
