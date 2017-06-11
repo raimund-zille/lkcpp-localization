@@ -20,6 +20,7 @@ We used an Augmented Monte Carlo Localization, and the features where extracted 
 
 ### The playground
 ![playground](./pictures/playground.PNG)
+
 To localize in the playground, we set the origin of the coordinates into one edge of the field. We used the 14 poles as landmarks and constructed a map with these.
 
 ### Demonstration Video
@@ -34,7 +35,9 @@ Yellow Arrow: Estimated position
 To extract the green poles the laserscan was checked for local minimas and checked if the width of them corresponds to the width of a pole. Therefore it detected the green poles as well as the pins and also chairlegs. We decided to use the laserscan for that task instead of the kinect as we had a 360 degree view and could find all the features. The problem that we detected more features (pins, chairlegs) was no problem, as the AMCL solves this problem.
 
 ### Localization
-We designed the AMCL with 1000 particles and used gaussian distribution as described in [ProbabilisticRobotics](https://docs.ufpr.br/~danielsantos/ProbabilisticRobotics.pdf). I worked on everything except the sample motion model and debugged the algorithm till it worked for our task. The actual position got calculated from all the particles with a modified k-mean algorithm (set k=1, if error to big, k=2 ...). 
+We designed the AMCL with 1000 particles and used gaussian distribution as described in [ProbabilisticRobotics](https://docs.ufpr.br/~danielsantos/ProbabilisticRobotics.pdf).
+
+I worked on everything except the sample motion model and debugged the algorithm till it worked for our task. The actual position got calculated from all the particles with a modified k-mean algorithm (set k=1, if error to big, k=2 ...). 
 
 #### Main Problems
 Here are the main problems we ran into.
