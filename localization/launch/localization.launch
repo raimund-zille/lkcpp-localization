@@ -1,0 +1,5 @@
+<launch>  
+  <node name="localization_node" pkg="localization" type="localization_node" output="screen" />  
+  <node name="feature_node" pkg="localization" type="feature_node"/>
+  <node name="kinect_laser_match_node" pkg="localization" type="kinect_laser_match_node" />
+</launch>

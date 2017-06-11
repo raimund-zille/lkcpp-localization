@@ -1,0 +1,7 @@
+*.o
+*.*~
+*.user
+*.autosave
+*~
+*.autosave
+build-angelina-Desktop_Qt_5_7_0_GCC_64bit-Vorgabe

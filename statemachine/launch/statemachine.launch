@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+
+<launch>  
+  <node name="statemachine_node" pkg="statemachine" type="statemachine_node" output="screen" > 
+        <param name="AngelinaIP" type="string" value="127.0.0.1" />
+  </node>
+</launch>

@@ -1,0 +1,157 @@
+#ifndef GLOBALSTATEMACHINE_H
+#define GLOBALSTATEMACHINE_H
+//ROS headers
+#include "ros/ros.h"
+#include <tf/tf.h>
+#include <geometry_msgs/PoseArray.h>
+
+//Angelina header
+#include "referee.h"
+#include <QTimer>
+#include <QWidget>
+#include <QtCore>
+#include <QThread>
+#include "image_processing.h"
+#include "lidar_processing.h"
+#include "StateMachine.h"
+#include "states.h"
+#include "ObjectParser.h"
+#include "Features/featureArray.h"
+#include "ShootMachine.h"
+#include "CalcABMachine.h"
+#include "FindColorMachine.h"
+
+typedef struct{
+    ///x coordinate
+    double x;
+    ///y coordinate
+    double y;
+    ///orientation
+    double phi;
+}position;
+
+struct GreenPostsCollector
+{
+    std::vector<Blob> normalizedGreenPosts;
+    std::vector<int> anglesWithoutPosts;
+    double turnedAngle = 0;
+};
+
+class RoboControl;
+
+class GlobalStateMachine : public QWidget, StateMachine<GeneralStates>
+{
+    Q_OBJECT
+
+public:
+    GlobalStateMachine(ros::NodeHandle &nh, QWidget* parent = 0);
+    ~GlobalStateMachine();
+
+public slots:
+
+private:
+    /// SUBSTATEMACHINE FUNKTIONS:
+    double smFrequency_;
+    FindColorMachine findColorSM_;
+    ShootMachine shootSM_;
+    CalcABMachine calcAB_SM_;
+    void calcA_B();
+
+    ObjectParser objParser;
+
+    int myPosID_;
+    int myOriID_;
+
+    void run();
+    void stateMachine();
+
+    double a_, b_;
+    bool ab_ang_received;
+
+
+    position pos_;
+    position posA_;
+    TeamColor teamColor_;
+    /// eigenes tor (das von der Startposition) 4 einträge, jeweils Ecken
+    std::vector<position> my_goal_;
+    /// gegnerisches tor (das von der Startposition weit weg ist) 4 einträge, jeweils Ecken
+    std::vector<position> enemy_goal_;
+
+    /// For recovery state
+    StateMachine<RecoverStates> recSM_;
+    GeneralStates stateBeforeRecovery_;
+    bool enteredRecoveryState_;
+    bool connected_;
+    bool stopReceived_;
+    bool gameOverReceived_;
+
+<<<<<<< Updated upstream
+=======
+    int shootedPucks_ = 3;
+>>>>>>> Stashed changes
+
+    Vector2d get_goal(int num);
+
+    GreenPostsCollector gpCollector_;
+
+    void localize();
+    bool localized_;
+
+    Referee *referee;
+    QTimer *keepAliveTimer_;
+    ros::NodeHandle nh_;
+    ImageProcessing imageProcessing_;
+    Lidar lidar_;
+    RoboControl *rob_;
+
+    ros::Publisher pos_pub;
+    ros::Publisher ab_pub;
+
+    ros::Subscriber pos_amcl_sub;
+    ros::Publisher pubFeature_;
+    ros::Subscriber odom_sub;
+
+    void pos_amcl_callback(const geometry_msgs::PoseArrayConstPtr &pos);
+    void odom_callback(const nav_msgs::OdometryConstPtr &odom);
+    position prev_odom_;
+
+    ///updated posAX_, posAY_ für angelina koordinaten
+    void updateXY();
+    void build_goals();
+
+    void sendEstimatedPos(double x, double y, double phi);
+    void send_A_B();
+    
+    bool calcBlobs();
+    void recoveryState();
+    
+    void getConsecutiveMids(std::vector<int>& consecutiveMids);
+    void reportReady();
+    void reportDone();
+    void reportGoal();
+    void tellAbRatio(double ratio);
+    void tellEgoPos();
+    void tellTeamColor();
+
+private Q_SLOTS:
+    void connectAngelina();
+    void slotSendAlive();
+    void slotGameStart();
+    void slotDetectionStart();
+    void slotGameOver();
+    void slotAbValues(double a, double b);
+    void slotStopMovement();
+    void slotTeamColor(TeamColor);
+    void recFlow(cv::Mat image, std::string window);
+    void slotConnected();
+    void slotConnectionfail();
+    void slotDisconnected();
+
+signals:
+    void finished();
+    void sndFlow(cv::Mat image, std::string window = "Image");
+    void sndConnectAngelina();
+};
+
+
+#endif // GLOBALSTATEMACHINE_H

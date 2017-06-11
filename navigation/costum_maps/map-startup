@@ -1,0 +1,3 @@
+DIR="$(pwd)"
+export TURTLEBOT_STAGE_MAP_FILE="${DIR}"/playing-field-obstacle.yaml
+export TURTLEBOT_STAGE_WORLD_FILE="${DIR}"/stage/playing-field-obstacle.world

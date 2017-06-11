@@ -1,0 +1,740 @@
+#include <QDebug>
+
+#include "referee.h"
+#include <QApplication>
+#include "GlobalStateMachine.h"
+#include <thread>
+#include <future>
+#include <roboControl.h>
+#include <sensor_msgs/LaserScan.h>
+#include <util.h>
+#include "opencv2/opencv.hpp"
+#include "opencv2/core/core.hpp"
+#include "opencv2/imgproc/imgproc.hpp"
+#include <opencv2/ml/ml.hpp>
+#include "angles/angles.h"
+#include "Features/featureArrayH.h"
+#include "time.h"
+using namespace std;
+using namespace cv;
+
+GlobalStateMachine::GlobalStateMachine(ros::NodeHandle &nh, QWidget* parent) :
+    QWidget(parent), nh_(nh), myPosID_(0), myOriID_(0), referee(0), a_(0), b_(0),
+    smFrequency_(20), StateMachine<GeneralStates>(GeneralStates::START, 20),
+    lidar_(nh_), imageProcessing_(nh_, &lidar_),
+    shootSM_(ShootStates::START, smFrequency_),
+    calcAB_SM_(CalculateAB_States::START, smFrequency_),
+    findColorSM_(FindColorStates::START, smFrequency_),
+    objParser(ObjectParserStates::START, smFrequency_),
+    connected_(false),
+    stopReceived_(false),
+    gameOverReceived_(false),
+    enteredRecoveryState_(false),
+    startGameReceived_(false),
+    startDetectionReceived_(false),
+    localized_(false),
+    stateBeforeRecovery_(GeneralStates::START),
+    recSM_(RecoverStates::START, smFrequency_)
+{
+    srand(time(NULL));
+    /// Create RoboControl
+    rob_ = new RoboControl(&objParser);
+
+    /// Configure SHOOTMACHINE
+    shootSM_.imageProcessing_ = &imageProcessing_;
+    shootSM_.rob_ = rob_;
+    shootSM_.objParser_ = &objParser;
+
+    /// Configure CalcABMachine
+    calcAB_SM_.imageProcessing_ = &imageProcessing_;
+    calcAB_SM_.rob_ = rob_;
+    calcAB_SM_.objParser_ = &objParser;
+
+    /// Configure FindColor Machine
+    findColorSM_.imageProcessing_ = &imageProcessing_;
+    findColorSM_.rob_ = rob_;
+    findColorSM_.objParser_ = &objParser;
+
+    /// Configure ObjectParser
+    objParser.imageProcessing_ = &imageProcessing_;
+    objParser.rob_ = rob_;
+
+    pos_.x = 0;
+    pos_.y = 0;
+    posA_.x = 0;
+    posA_.y = 0;
+    ab_ang_received = false;
+    connectAngelina();
+
+    /// Run GlobalStateMachine in separat thread => Angelina runs on main thread
+    std::thread t1 = std::thread(&GlobalStateMachine::run, this);
+    t1.detach();
+
+    /// Allow connectAngelina to be called from ros thread
+    QObject::connect(this, SIGNAL(sndConnectAngelina()), SLOT(connectAngelina()), Qt::QueuedConnection);
+
+
+    /// Stuff to display images
+    qRegisterMetaType< cv::Mat >("cv::Mat");
+    qRegisterMetaType< std::string >("std::string");
+    // create objects from QThread and QObject class
+    QObject::connect(this, SIGNAL(sndFlow(cv::Mat, std::string)), SLOT(recFlow(cv::Mat, std::string)), Qt::QueuedConnection);
+
+    /// Keep alive timer for Angelina
+    keepAliveTimer_ = new QTimer(this);
+    connect(keepAliveTimer_, SIGNAL(timeout()), this, SLOT(slotSendAlive()));
+    keepAliveTimer_->start(15000);
+
+    /// Timer for sending position
+    tellPositionTimer_ = new QTimer(this);
+    connect(tellPositionTimer_, SIGNAL(timeout()), this, SLOT(slotTellEgoPos()));
+    keepAliveTimer_->start(15000);
+
+    ROS_INFO_STREAM("State machine initialized");
+}
+
+GlobalStateMachine::~GlobalStateMachine()
+{
+    delete referee;
+}
+
+//cv::Mat img = cv::Mat(800, 800, CV_8UC3, cv::Scalar(0,0,0));
+void GlobalStateMachine::run()
+{
+    ros::NodeHandle nh;
+    pos_pub = nh.advertise<geometry_msgs::Pose>("estimatedPos", 1);
+    ab_pub = nh.advertise<geometry_msgs::Vector3>("fieldDim",1);
+    pubFeature_ = nh_.advertise<localization::featureArrayH>("featuresGreen", 1);
+    pos_amcl_sub = nh.subscribe("myPositionCloud", 1, &GlobalStateMachine::pos_amcl_callback, this);
+    odom_sub = nh.subscribe("odom",1, &GlobalStateMachine::odom_callback, this);
+    ros::Rate loop_rate(smFrequency_);
+
+    ROS_INFO_STREAM("Entering ros loop.");
+
+    while (ros::ok())
+    {
+        if (gameOverReceived_)
+            break;
+
+        /// Image Processing - Process all images
+        imageProcessing_.calculateBlobs();
+        /// Image Processing - Get all objects from ImageProcessing
+        ImageProcessingObjects objects = imageProcessing_.getObjects();
+
+        /// Run the global state machine
+        stateMachine();
+
+        /// Run ObjectParser => create permanent objects
+        objParser.run();
+
+
+        /// Image Processing - Show processed images
+       // emit sndFlow(imageProcessing_.showProcessedImage(), std::string("Viewfield"));
+
+        if (imageProcessing_.objects_ok())
+        {
+            localization::featureArrayH featureArray;
+            std::vector < std::vector <Blob> > allFeatures;
+//            allFeatures.push_back(objects.blackRobot);
+//            allFeatures.push_back(objects.bluePucks);
+            allFeatures.push_back(objects.greenPosts);
+//            allFeatures.push_back(objects.yellowPucks);
+
+            for (std::vector<Blob> object : allFeatures){
+                for(Blob blob : object){
+                    localization::feature feature;
+                    feature.r = blob.meanDistance;
+                    feature.phi = blob.angleDegree;
+                    feature.knownCorr = -1;
+                    featureArray.features.push_back(feature);
+                }
+            }
+            pubFeature_.publish(featureArray);
+
+            //imageProcessing_.isPuckAtRobot(ImageProcessingTypes::YELLOW);
+        }
+        ros::spinOnce();
+        loop_rate.sleep();
+    }
+    QApplication::quit();
+}
+
+ros::Time rosTime;
+
+void GlobalStateMachine::recoveryState()
+{
+    SUBSM_DURING(recSM_);
+    case RecoverStates::START:
+        if (!connected_)
+            recSM_.changeState(RecoverStates::RECONNECT);
+        if (stopReceived_)
+        {
+            recSM_.changeState(RecoverStates::STOP);
+        }
+        break;
+
+    case RecoverStates::STOP:
+        if (!stopReceived_)
+            recSM_.changeState(RecoverStates::END);
+        break;
+
+    case RecoverStates::RECONNECT:
+        SUBSM_DO_IN_INTERVAL(recSM_, 5){
+            if (!connected_)
+            {
+                ROS_INFO_STREAM("Try to reconnect!");
+                emit sndConnectAngelina();
+            }
+            else
+                recSM_.changeState(RecoverStates::END);
+        }
+        break;
+
+    case RecoverStates::END:
+        enteredRecoveryState_ = false;
+        changeState(stateBeforeRecovery_);
+        break;
+
+        SUBSM_EXIT(recSM_);
+
+        SUBSM_ENTRY(recSM_);
+    case RecoverStates::START:
+        ROS_INFO("Start recovery!");
+        break;
+
+    case RecoverStates::STOP:
+        ROS_INFO("Start STOP!");
+        break;
+
+    case RecoverStates::RECONNECT:
+        ROS_INFO("Start RECONNECT");
+        break;
+
+    case RecoverStates::END:
+        ROS_INFO("Recovered");
+        break;
+
+        SUBSM_END(recSM_);
+}
+
+void GlobalStateMachine::stateMachine() {
+    ImageProcessingObjects objects = imageProcessing_.getObjects();
+
+    shootSM_.goals.clear();
+    shootSM_.goals.push_back(get_goal(1));
+    shootSM_.goals.push_back(get_goal(2));
+    shootSM_.goals.push_back(get_goal(3));
+
+//    //if (doInGlobalInterval(0.1)) {
+//        //ROS_INFO_STREAM("IMG");
+//        imageProcessing_.image_to_draw_ = cv::Mat(800, 800, CV_8UC3, cv::Scalar(0,0,0));
+//        std::vector<cv::Point2f> points = objParser.convertToWorldPoint(objParser.greenPosts);
+//        double angle = imageProcessing_.calcKmeans(imageProcessing_.image_to_draw_ , objParser.greenPosts);
+//        objParser.angleMapOdom = angles::shortest_angular_distance(angles::from_degrees(angle), 0);
+//        imageProcessing_.drawBlobsInMap(imageProcessing_.image_to_draw_ , objParser.greenPostsSide1);
+//        imageProcessing_.drawBlobsInMap(imageProcessing_.image_to_draw_ , objParser.greenPostsSide2);
+//        imageProcessing_.drawPositionInMap(imageProcessing_.image_to_draw_ ,rob_->poseInit_,cv::Scalar(90,120,180));
+//        imageProcessing_.drawPositionInMap(imageProcessing_.image_to_draw_ ,rob_->currPos_,cv::Scalar(255,120,180));
+//        imageProcessing_.drawLine(imageProcessing_.image_to_draw_ ,rob_->currLine_,cv::Scalar(255,120,180));
+//        imageProcessing_.drawVector2d(imageProcessing_.image_to_draw_ ,findColorSM_.aim,cv::Scalar(255,80,255));
+//        imageProcessing_.drawLineSegment(imageProcessing_.image_to_draw_, rob_->lineToGoal_, cv::Scalar(255,255,255));
+//        imageProcessing_.drawBlobsInMap(imageProcessing_.image_to_draw_ , objParser.bluePucks.blobs);
+//        imageProcessing_.drawBlobsInMap(imageProcessing_.image_to_draw_ , objParser.yellowPucks.blobs);
+//        emit sndFlow(imageProcessing_.image_to_draw_ , std::string("Pic"));
+    //}
+
+    if((!connected_ || gameOverReceived_ || stopReceived_ ) && !enteredRecoveryState_)
+    {
+        stateBeforeRecovery_ = getState();
+        changeState(GeneralStates::RECOVERY);
+    }
+
+    SM_DURING; /// DEFINE DURING STATE
+
+    case GeneralStates::START:{
+        if (objParser.greenPostsSplitted) {
+           // calcAB_SM_.createAB(objParser.greenPostsSide1, objParser.greenPostsSide2);
+           //changeState(GeneralStates::CALC_A_B);
+        }
+        if (startDetectionReceived_)
+            changeState(GeneralStates::FIND_COLOR);
+        break;
+    }
+    case GeneralStates::TURN_TO_NO_BLOB: {
+
+        break;
+    }
+    case GeneralStates::FIND_COLOR: {
+        if (findColorSM_.run() == FindColorStates::END) {
+            teamColor_ = findColorSM_.teamColor_;
+            tellTeamColor();
+            changeState(GeneralStates::CALC_A_B);
+        }
+        SM_AFTER(100) {
+            tellTeamColor();
+            changeState(GeneralStates::CALC_A_B);
+        }
+
+        break;
+    }
+    case GeneralStates::CALC_A_B:
+        if (objParser.greenPostsSplitted) {
+            double a_b = calcAB_SM_.createAB(objParser.greenPostsSide1, objParser.greenPostsSide2);
+            tellAbRatio(a_b);
+            changeState(GeneralStates::WAIT_A_B);
+        }
+        break;
+
+    case GeneralStates::WAIT_A_B:
+        if(ab_ang_received){
+            changeState(GeneralStates::LOCALIZE);
+        }
+        SM_AFTER(10){
+            changeState(GeneralStates::LOCALIZE);
+        }
+        break;
+
+    case GeneralStates::LOCALIZE:
+        localize();
+        if(localized_){
+            ROS_INFO_STREAM("LOCALIZED");
+            changeState(GeneralStates::SHOOT_PUCK);
+        }
+        SM_AFTER(15){
+            ROS_INFO_STREAM("LOCALIZE TIMEOUT");
+            changeState(GeneralStates::SHOOT_PUCK);
+        }
+        break;
+
+    case GeneralStates::SHOOT_PUCK:
+        if (startGameReceived_)
+        {
+            if (shootedPucks_ != shootSM_.shootedPucks) {
+                shootedPucks_ = shootSM_.shootedPucks;
+                reportGoal();
+            }
+            if (shootedPucks_ == 3) {
+                ROS_INFO_STREAM("I think I am done! --> Exit");
+                reportDone();
+                gameOverReceived_ = true;
+            }
+//            if ((posA_.x < a_/10) || (posA_).x > (3 * a_ - a_/10) || (posA_.y < b_/12) || (posA_).y > (b_ - b_/12)){
+//                shootSM_.changeState(ShootStates::DRIVE_RANDOM);
+//            }
+            shootSM_.run();
+        }
+        break;
+
+    case GeneralStates::RECOVERY:
+        recoveryState();
+    break;
+
+    SM_EXIT; /// DEFINE EXIT STATE HERE
+    case GeneralStates::FIND_COLOR:
+        ROS_INFO_STREAM("GLOBALC STATE MACHINE - FIND COLOR took: " << ros::Time::now() - rosTime);
+        break;
+    SM_ENTRY; /// DEFINE ENTRY STATE
+
+    case GeneralStates::START:
+        ROS_INFO_STREAM("Start of global GlobalStateMachine");
+        reportReady();
+        break;
+    case GeneralStates::FIND_COLOR:
+        findColorSM_.changeState(FindColorStates::START);
+        rosTime = ros::Time::now();
+        ROS_INFO_STREAM("GlobalStateMachine - FIND_COLOR");
+        break;
+    case GeneralStates::CALC_A_B:
+        SM_AFTER(2){
+            ROS_INFO_STREAM("CALC_A_B -> Started");
+        }
+        break;
+
+    case GeneralStates::WAIT_A_B:
+        ROS_INFO("Waiting for A-B to receive from angelina");
+        break;
+    case GeneralStates::LOCALIZE:
+        ROS_INFO("Localize");
+        break;
+    case GeneralStates::RECOVERY:
+        ROS_INFO("Recovery");
+        recSM_ = StateMachine<RecoverStates>(RecoverStates::START, smFrequency_);
+        enteredRecoveryState_ = true;
+        break;
+    SM_END;
+}
+
+void GlobalStateMachine::getConsecutiveMids(vector<int>& consecutiveMids)
+{
+    for (int i = 0; i < gpCollector_.anglesWithoutPosts.size();)
+    {
+        int start = i;
+        int stop = gpCollector_.anglesWithoutPosts.size() - 1;
+        for (int j = i + 1; j < gpCollector_.anglesWithoutPosts.size();j++)
+        {
+            if(!(gpCollector_.anglesWithoutPosts[j] == gpCollector_.anglesWithoutPosts[i] + 1))
+            {
+                stop = i;
+                break;
+            }
+            i++;
+        }
+        i++;
+        consecutiveMids.push_back(round((gpCollector_.anglesWithoutPosts[stop] +
+                                         gpCollector_.anglesWithoutPosts[start]) / 2)*20);
+    }
+}
+
+Vector2d GlobalStateMachine::get_goal(int num){
+    double goal_x = 0;
+    double goal_y = 0;
+    for(size_t i = 0; i < enemy_goal_.size(); i++){
+        goal_x += enemy_goal_[i].x;
+        goal_y += enemy_goal_[i].y;
+    }
+    goal_x /= enemy_goal_.size();
+    goal_y /= enemy_goal_.size();
+
+    if(num == 2){
+        goal_x += b_/3;
+    }else if(num==3){
+        goal_x -= b_/3;
+    }
+
+    double r;
+    double phi;
+    rob_->r_phiRad_from_pos(pos_.x, pos_.y, pos_.phi, goal_x, goal_y, r, phi);
+
+    Vector2d returnVec;
+    double phi_o = tf::getYaw(rob_->currPos_.orientation);
+    returnVec.x = rob_->currPos_.position.x + cos(phi_o+phi);
+    returnVec.y = rob_->currPos_.position.y + sin(phi_o+phi);
+    return returnVec;
+}
+
+void GlobalStateMachine::localize(){
+    static StateMachine<Localize> sm(Localize::START, smFrequency_);
+    SUBSM_DURING(sm);
+    case Localize::START:
+        sm.changeState(Localize::TURN_TO_3_GREEN);
+        break;
+
+    case Localize::TURN_TO_3_GREEN:
+        //ROS_INFO_STREAM("TURN TO 3 GREEN");
+        SUBSM_DO_UNTIL(sm, 5){
+            rob_->move(-0.3, 0);
+
+        if(imageProcessing_.getObjects().greenPosts.size() >= 4){
+            sm.changeState(Localize::SEND_A_B);
+        }
+        }else{
+            rob_->move(-0.3, 0);
+            if(imageProcessing_.getObjects().greenPosts.size() >= 3){
+                sm.changeState(Localize::SEND_A_B);
+            }
+        }
+        SUBSM_AFTER(sm, 10){
+            sm.changeState(Localize::SEND_A_B);
+        }
+
+        break;
+
+    case Localize::SEND_A_B:
+        SUBSM_DO_IN_INTERVAL(sm, 0.2){
+            send_A_B();
+        }
+        SUBSM_AFTER(sm, 1){
+            sm.changeState(Localize::WAIT);
+        }
+        break;
+
+    case Localize::WAIT:
+        SUBSM_AFTER(sm, 3){
+
+            localized_ = true;
+        }
+        break;
+
+    SUBSM_EXIT(sm);
+    case Localize::TURN_TO_3_GREEN:
+        break;
+
+    SUBSM_ENTRY(sm);
+    case Localize::START:
+        ROS_INFO("Start loclaize");
+        //sm.changeState(Localize::TURN_TO_3_GREEN);
+        break;
+
+    case Localize::TURN_TO_3_GREEN:
+        ROS_INFO("Turn to 3 green");
+        break;
+
+    case Localize::SEND_A_B:
+        ROS_INFO("Send a,b");
+        break;
+
+    case Localize::WAIT:
+        ROS_INFO("wait localization");
+        break;
+    SUBSM_END(sm);
+}
+
+
+void GlobalStateMachine::recFlow(cv::Mat image, string window)
+{
+    if (image.empty())
+        return;
+    cv::imshow(window, image);
+    cv::waitKey(1);
+}
+
+void GlobalStateMachine::slotConnected()
+{
+    ROS_INFO_STREAM("Connected!");
+    connected_ = true;
+}
+
+void GlobalStateMachine::slotConnectionfail()
+{
+    //TODO change to false
+    ROS_INFO_STREAM("Connection Failed!");
+    connected_ = false;
+}
+
+void GlobalStateMachine::slotDisconnected()
+{
+    //TODO change to false
+    ROS_INFO_STREAM("Disconnected!");
+    connected_ = false;
+}
+
+void GlobalStateMachine::sendEstimatedPos(double x, double y, double phi){
+    geometry_msgs::Pose myPos;
+    myPos.position.x = x;
+    myPos.position.y = y;
+    tf::Quaternion orientation = tf::createQuaternionFromYaw(phi);
+    memcpy(&myPos.orientation,&orientation,sizeof(tf::Quaternion));
+
+    pos_pub.publish(myPos);
+}
+
+void GlobalStateMachine::send_A_B(){
+    geometry_msgs::Vector3 ab;
+    ab.x = a_;
+    ab.y = b_;
+    ab_pub.publish(ab);
+}
+
+void GlobalStateMachine::pos_amcl_callback(const geometry_msgs::PoseArrayConstPtr &pos){
+    pos_.x = pos->poses[0].position.x;
+    pos_.y = pos->poses[0].position.y;
+    pos_.phi = tf::getYaw(pos->poses[0].orientation);
+    //ROS_INFO_STREAM("I'm at: " << pos_.x<<"/"<<pos_.y<<"/"<<pos_.phi);
+    updateXY();
+}
+
+void GlobalStateMachine::odom_callback(const nav_msgs::OdometryConstPtr &odom){
+
+    position curr_odom;
+    curr_odom.x = odom->pose.pose.position.x;
+    curr_odom.y = odom->pose.pose.position.y;
+    curr_odom.phi = tf::getYaw(odom->pose.pose.orientation);
+
+
+    double dy = curr_odom.y - prev_odom_.y;
+    double dx = curr_odom.x - prev_odom_.x;
+    double d_rot_1 = atan2(dy,dx) - prev_odom_.phi;
+    double d_rot_2 = curr_odom.phi - prev_odom_.phi - d_rot_1;
+    double d_trans = sqrt(dy*dy+dx*dx);
+
+
+    pos_.x = pos_.x + d_trans*cos(pos_.phi+d_rot_1);
+    pos_.y = pos_.y + d_trans*sin(pos_.phi+d_rot_1);
+
+    pos_.phi = pos_.phi+d_rot_1+d_rot_2;
+
+    while(pos_.phi>M_PI){
+        pos_.phi -= 2*M_PI;
+    }
+    while(pos_.phi<M_PI){
+        pos_.phi += 2*M_PI;
+    }
+    updateXY();
+}
+
+void GlobalStateMachine::connectAngelina()
+{
+    if (referee)
+        delete referee;
+    referee = new Referee(7, this);
+
+    connect(referee, SIGNAL(gameStart()), this, SLOT(slotGameStart()));
+    connect(referee, SIGNAL(detectionStart()), this, SLOT(slotDetectionStart()));
+    connect(referee, SIGNAL(gameOver()), this, SLOT(slotGameOver()));
+    connect(referee, SIGNAL(abValues(double,double)), this, SLOT(slotAbValues(double,double)));
+    connect(referee, SIGNAL(stopMovement()), this, SLOT(slotStopMovement()));
+    connect(referee, SIGNAL(trueColorOfTeam(TeamColor)), this, SLOT(slotTeamColor(TeamColor)));
+    connect(referee, SIGNAL(connected()), this, SLOT(slotConnected()));
+    connect(referee, SIGNAL(disconnected()), this, SLOT(slotDisconnected()));
+    connect(referee, SIGNAL(connectFailed()), this, SLOT(slotConnectionfail()));
+   
+    ros::NodeHandle pnh("~");
+    std::string angelinaIP;
+    angelinaIP = pnh.getParam("AngelinaIP", angelinaIP) ? angelinaIP : "127.0.0.1";
+    ROS_INFO_STREAM(angelinaIP);
+
+    referee->connectToServer(QString::fromStdString(angelinaIP), 10000);
+}
+
+void GlobalStateMachine::reportReady()
+{
+    ROS_INFO_STREAM("Report ready!");
+    referee->reportReady();
+}
+
+void GlobalStateMachine::reportDone()
+{
+    ROS_INFO_STREAM("Report done!");
+    referee->reportDone();
+}
+
+void GlobalStateMachine::reportGoal()
+{
+    ROS_INFO_STREAM("Report goal!");
+    referee->reportGoal();
+}
+
+void GlobalStateMachine::tellAbRatio(double ratio)
+{
+    ROS_INFO_STREAM("Tell a/b ratio: " << ratio);
+    referee->tellAbRatio(ratio);
+}
+
+void GlobalStateMachine::slotTellEgoPos()
+{
+    //ROS_INFO_STREAM("Tell ego position!");
+    referee->tellEgoPos(posA_.x, posA_.y);
+}
+
+void GlobalStateMachine::tellTeamColor()
+{
+    referee->tellTeamColor(teamColor_);
+}
+
+void GlobalStateMachine::slotSendAlive()
+{
+    ROS_INFO_STREAM("Send alive!");
+    referee->sendAlive();
+}
+
+void GlobalStateMachine::slotGameStart()
+{
+    ROS_INFO_STREAM("Start game received!");
+    stopReceived_ = false;
+    startGameReceived_ = true;
+}
+
+void GlobalStateMachine::slotDetectionStart()
+{
+    ROS_INFO_STREAM("Start detection received!");
+    stopReceived_ = false;
+    startDetectionReceived_ = true;
+}
+
+void GlobalStateMachine::slotGameOver()
+{
+    ROS_INFO_STREAM("Game over received!");
+    gameOverReceived_ = true;
+}
+
+void GlobalStateMachine::slotStopMovement()
+{
+    ROS_INFO_STREAM("Stop immediately received!");
+    stopReceived_ = true;
+}
+
+void GlobalStateMachine::slotAbValues(double a, double b)
+{
+    ROS_INFO_STREAM("Real a: " << a << " Real b: " << b);
+    ab_ang_received = true;
+    a_ = a;
+    b_ = b;
+    shootSM_.a = a;
+    shootSM_.b = b;
+    build_goals();
+}
+
+void GlobalStateMachine::slotTeamColor(TeamColor color)
+{
+    findColorSM_.teamColor_ = color;
+    if (color == yellow){
+        teamColor_ = color;
+        imageProcessing_.isYellowTeam_ = true;
+        ROS_INFO_STREAM("Real color: yellow");
+    }
+    else{
+        teamColor_ = color;
+        imageProcessing_.isYellowTeam_ = false;
+        ROS_INFO_STREAM("Real color: blue");
+    }
+}
+
+void GlobalStateMachine::build_goals(){
+    //make sure they have 4 positions
+    position dummy;
+    while(my_goal_.size()<4){
+
+        my_goal_.push_back(dummy);
+    }
+    while(enemy_goal_.size()<4){
+        enemy_goal_.push_back(dummy);
+    }
+
+    //our
+    my_goal_[0].x = 0.25*a_;
+    my_goal_[0].y = 1/3*b_;
+
+    my_goal_[1].x = 0.25*a_;
+    my_goal_[1].y = 2/3*b_;
+
+    my_goal_[2].x = 0.5*a_;
+    my_goal_[2].y = 1/3*b_;
+
+    my_goal_[3].x = 0.55*a_;
+    my_goal_[4].y = 2/3*b_;
+
+    //enemy
+    enemy_goal_[0].x = 2.5*a_;
+    enemy_goal_[0].y = 1/3*b_;
+
+    enemy_goal_[1].x = 2.5*a_;
+    enemy_goal_[1].y = 2/3*b_;
+
+    enemy_goal_[2].x = 2.75*a_;
+    enemy_goal_[2].y = 1/3*b_;
+
+    enemy_goal_[3].x = 2.75*a_;
+    enemy_goal_[3].y = 2/3*b_;
+
+}
+
+void GlobalStateMachine::updateXY()
+{
+    switch(teamColor_)
+    {
+    case yellow:
+    {
+        posA_.x = 3*a_ - pos_.x;
+        posA_.y = pos_.y;
+        break;
+    }
+    case blue:
+    {
+        posA_.x = pos_.x;
+        posA_.y = b_ - pos_.y;
+        break;
+    }
+    default:
+        return;
+    }
+}

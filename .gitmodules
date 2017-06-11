@@ -1,0 +1,3 @@
+[submodule "angelina"]
+	path = angelina
+	url = https://gitlab.ldv.ei.tum.de/no72gug/angelina.git
