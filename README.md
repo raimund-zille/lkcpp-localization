@@ -1,7 +1,7 @@
 lkcpp
 =======
 
-This was a project for the course "Leistungskurs C++" during my electrical and computational engineering master at the Technical University Munich.
+This was a project for the course "Leistungskurs C++" during my electrical and computational engineering master (WS 16/17) at the Technical University Munich.
 
 ### Group Task
 Make a Turtlebot play "hockey". Therefore he had to localize his self in the playground and then push 3 monochrome pins into a colored area on the other side of the field. During that he had to avoid the enemy robot, which had to do the same task just with the other color and started at the other side of the field.
