@@ -19,7 +19,7 @@ I worked at the topics Localization and the Lidar-progessing.
 We used an Augmented Monte Carlo Localization, and the features where extracted from the Lidar.
 
 ### The playground
-![playground](pictures/playground.png)
+![playground](./pictures/playground.PNG)
 To localize in the playground, we set the origin of the coordinates into one edge of the field. We used the 14 poles as landmarks and constructed a map with these.
 
 ### Demonstration Video
@@ -36,17 +36,17 @@ To extract the green poles the laserscan was checked for local minimas and check
 ### Localization
 We designed the AMCL with 1000 particles and used gaussian distribution as described in [ProbabilisticRobotics](https://docs.ufpr.br/~danielsantos/ProbabilisticRobotics.pdf). I worked on everything except the sample motion model and debugged the algorithm till it worked for our task. The actual position got calculated from all the particles with a modified k-mean algorithm (set k=1, if error to big, k=2 ...). 
 
-## Main Problems
+#### Main Problems
 Here are the main problems we ran into.
 
-# Not enough features
+##### Not enough features
 While working without the lidar we had a problem that we sometimes just found 1-2 features, which was a problem as long as the correct position wasn't found. This was solved by using the lidar.
 
-# No explicit position
+##### No explicit position
 As this field and the map is symmetric, there were always 2 possible positions with the given features. This was solved by detecting the side first depending on the colored field on the ground, then randomly distributing all particles in this side of field.
 
-# Getting stucked into a local maxima
+##### Getting stucked into a local maxima
 This took quite a while, till I realized you have to add gaussian noise to all the particles choosen to overcome this problem, as otherwise it gets to sure about one position and never finds the global maxima.
 
-## Improvment
+### Improvment
 The time-consumption can be improved by quite a lot. We got a localization every approximatly every second, which was sufficient for our task.
